@@ -120,18 +120,32 @@ curl -X POST http://localhost:8000/audit/evidence \
 **摘要只覆盖该冻结载荷**，不含 `evidence_id`、生成时间等易变字段；
 对同一数据状态下的同一输入重复生成，摘要必然相同（每次生成仍是独立的新包，`evidence_id` 不同）。
 
+**签发依据（seal）**：签发时，服务另用一把**保存在数据库之外的密钥**对
+`(evidence_id, application_number, target_date, sha256)` 计算 HMAC-SHA256 并随包落库。
+密钥不落库，因此该依据不依赖任何可改写的数据库记录：篡改者即使把快照换成另一份
+合法快照、并把库内摘要同步改成新摘要（甚至从别的包连 seal 一起复制），也无法伪造出
+与新内容匹配的 seal。seal 只用于服务端复验，不出现在任何 API 响应中。
+
 ### GET /audit/evidence/{evidence_id} — 只读复验
 
-只读取冻结快照，**不回查修订表**：重新计算 SHA-256 并与存储摘要比对：
+只读取冻结快照，**不回查修订表**。复验同时核对三项：**签发依据（seal）、冻结字节、
+库存摘要**——三者齐备才判可信：
 
 ```bash
 curl http://localhost:8000/audit/evidence/bafd97da246040fca6327cd86e77529a
 ```
 
-- 摘要一致：`verified: true`，返回 `snapshot`（冻结的目标日 / 有效权利要求 / 问题）；
-- 快照或存储摘要被篡改：仍返回 `200`，但 `verified: false`、`snapshot: null`，
+- 三项全部一致：`verified: true`，返回 `snapshot`（冻结的目标日 / 有效权利要求 / 问题）；
+- 快照或存储摘要被**单独**篡改：仍返回 `200`，但 `verified: false`、`snapshot: null`，
   并在 `integrity_error` 中以 `SNAPSHOT_DIGEST_MISMATCH` 同时给出
   `stored_digest` 与现场重算的 `recomputed_digest`（`digest` 字段即重算值）；
+- 快照与摘要被**联动替换**（二者彼此相符）：`verified: false`、`snapshot: null`，
+  `integrity_error.code = SEAL_MISMATCH`——库存摘要与重算摘要即使一致也不足以判定可信；
+- **无签发依据的旧包**（本机制上线前签发、库中 `seal` 为空的记录）：仍可正常读取
+  （`200`，`digest`/`stored_digest` 等字段照常返回），但不会仅凭库内摘要一致返回
+  `verified: true`，而是 `verified: false`、`snapshot: null`，
+  `integrity_error.code = SEAL_MISSING`；旧包若发生单项篡改，仍按
+  `SNAPSHOT_DIGEST_MISMATCH` 报告；
 - 证据包不存在：`404`。
 
 ```json
@@ -156,6 +170,18 @@ curl http://localhost:8000/audit/evidence/bafd97da246040fca6327cd86e77529a
 即使之后的修订自动封闭了该区间）。任何持有快照的一方都可以自行复算
 `SHA-256(UTF-8 紧凑 JSON)` 与返回摘要比对。
 
+### 签发密钥（seal key）
+
+复验所依赖的签发密钥保存在**数据库之外**，因此改写数据库记录无法伪造签发依据：
+
+- 环境变量 `EVIDENCE_SEAL_KEY`：设置后以其为密钥来源（适合生产环境用密管系统注入）；
+- 未设置时，首次签发会在数据库文件旁生成随机密钥文件 `evidence_seal.key`
+  （权限 `0600`），之后一直复用——Docker 部署中它落在命名卷 `patent-data` 内，
+  随卷持久化，**容器重启后新包、旧包均可继续复验**。
+
+请勿删除或更换该密钥：已签发包的 seal 都是用原密钥计算的，密钥丢失或变更后，
+这些包复验会报 `SEAL_MISMATCH`（其冻结字节与摘要本身不受影响，仍原样返回）。
+
 ### 其他端点
 
 - `GET /applications/{application_number}` — 查看某申请的完整版本链（调试/核对用）
@@ -169,8 +195,8 @@ app/
   models.py    # Pydantic 请求/响应模型（含提交期结构校验）
   store.py     # 写入路径：幂等 + 版本链校验 + 单事务
   audit.py     # 目标日重建、引用有效性、DFS 成环检测
-  evidence.py  # 证据包：固定字段顺序冻结 UTF-8 JSON、SHA-256、只读复验/篡改报告
-  db.py        # SQLite 连接与 schema（含 evidence_packages 快照表）
+  evidence.py  # 证据包：固定字段顺序冻结 UTF-8 JSON、SHA-256、库外密钥签发依据、只读复验/篡改报告
+  db.py        # SQLite 连接与 schema（含 evidence_packages 快照表与就地迁移）
   errors.py    # 领域错误 → HTTP 状态码
 tests/test_api.py
 tests/test_evidence.py

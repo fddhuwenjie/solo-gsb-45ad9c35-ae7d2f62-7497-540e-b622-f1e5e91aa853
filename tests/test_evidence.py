@@ -212,6 +212,206 @@ def test_tampered_stored_digest_reports_mismatch(client):
     assert read_body["digest"] == created["sha256"]  # 重算值仍是原始摘要
 
 
+# ---------- 联动篡改（替换快照 + 同步改写摘要） ----------
+
+def test_coordinated_tamper_rejected(client):
+    """保留 evidence_id，把快照换成另一份合法快照并同步改 sha256：
+    冻结字节与库存摘要虽自洽，签发依据对不上，仍不得判为可信。"""
+    seed_basic(client)
+    victim = make_evidence(client, "CN2026-001", "2026-03-01").json()
+    other = make_evidence(client, "CN2026-001", "2026-01-01").json()
+    assert other["sha256"] != victim["sha256"]
+
+    db = client.app.state.db
+    with db._lock:
+        foreign = db.conn.execute(
+            "SELECT snapshot, sha256 FROM evidence_packages WHERE evidence_id = ?",
+            (other["evidence_id"],),
+        ).fetchone()
+        db.conn.execute(
+            "UPDATE evidence_packages SET snapshot = ?, sha256 = ? WHERE evidence_id = ?",
+            (foreign["snapshot"], foreign["sha256"], victim["evidence_id"]),
+        )
+
+    r = client.get(f"/audit/evidence/{victim['evidence_id']}")
+    assert r.status_code == 200, r.text
+    read_body = r.json()
+    # 后两者相符：重算摘要 == 库存摘要 == 替换后的新摘要
+    assert read_body["digest"] == other["sha256"]
+    assert read_body["stored_digest"] == other["sha256"]
+    # 但仍报异常且快照不外发
+    assert read_body["verified"] is False
+    assert read_body["snapshot"] is None
+    err = read_body["integrity_error"]
+    assert err is not None
+    assert err["code"] == "SEAL_MISMATCH"
+
+
+def test_coordinated_tamper_with_foreign_seal_rejected(client):
+    """连带复制另一包的 seal 也无法通过：seal 绑定 evidence_id，不可移植。"""
+    seed_basic(client)
+    victim = make_evidence(client, "CN2026-001", "2026-03-01").json()
+    other = make_evidence(client, "CN2026-001", "2026-01-01").json()
+
+    db = client.app.state.db
+    with db._lock:
+        foreign = db.conn.execute(
+            "SELECT snapshot, sha256, seal FROM evidence_packages WHERE evidence_id = ?",
+            (other["evidence_id"],),
+        ).fetchone()
+        db.conn.execute(
+            "UPDATE evidence_packages SET snapshot = ?, sha256 = ?, seal = ?"
+            " WHERE evidence_id = ?",
+            (foreign["snapshot"], foreign["sha256"], foreign["seal"],
+             victim["evidence_id"]),
+        )
+
+    read_body = client.get(f"/audit/evidence/{victim['evidence_id']}").json()
+    assert read_body["verified"] is False
+    assert read_body["snapshot"] is None
+    assert read_body["integrity_error"]["code"] == "SEAL_MISMATCH"
+
+
+def test_coordinated_tamper_leaves_other_packages_untouched(client):
+    """联动篡改只影响被替换的包，其余包（含被复制来源）复验不受影响。"""
+    seed_basic(client)
+    victim = make_evidence(client, "CN2026-001", "2026-03-01").json()
+    other = make_evidence(client, "CN2026-001", "2026-01-01").json()
+
+    db = client.app.state.db
+    with db._lock:
+        foreign = db.conn.execute(
+            "SELECT snapshot, sha256 FROM evidence_packages WHERE evidence_id = ?",
+            (other["evidence_id"],),
+        ).fetchone()
+        db.conn.execute(
+            "UPDATE evidence_packages SET snapshot = ?, sha256 = ? WHERE evidence_id = ?",
+            (foreign["snapshot"], foreign["sha256"], victim["evidence_id"]),
+        )
+
+    assert client.get(f"/audit/evidence/{victim['evidence_id']}").json()["verified"] is False
+    source = client.get(f"/audit/evidence/{other['evidence_id']}").json()
+    assert source["verified"] is True
+    assert source["digest"] == other["sha256"]
+
+
+# ---------- 旧包（无签发依据） ----------
+
+def test_legacy_package_without_seal_not_verified(client):
+    """旧随机编号仍能读取，但无签发依据的旧包不得仅凭库内摘要一致返回 verified=true。"""
+    seed_basic(client)
+    created = make_evidence(client, "CN2026-001", "2026-03-01").json()
+    db = client.app.state.db
+    with db._lock:
+        db.conn.execute(  # 模拟机制上线前签发的旧包：没有 seal
+            "UPDATE evidence_packages SET seal = NULL WHERE evidence_id = ?",
+            (created["evidence_id"],),
+        )
+
+    r = client.get(f"/audit/evidence/{created['evidence_id']}")
+    assert r.status_code == 200, r.text
+    read_body = r.json()
+    assert read_body["evidence_id"] == created["evidence_id"]
+    assert read_body["digest"] == created["sha256"]      # 库内摘要自洽
+    assert read_body["stored_digest"] == created["sha256"]
+    assert read_body["verified"] is False                # 但不得判为可信
+    assert read_body["snapshot"] is None
+    assert read_body["integrity_error"]["code"] == "SEAL_MISSING"
+
+
+def test_legacy_package_single_tamper_report_still_works(client):
+    """旧包发生单项篡改时，仍按 SNAPSHOT_DIGEST_MISMATCH 报告。"""
+    seed_basic(client)
+    created = make_evidence(client, "CN2026-001", "2026-03-01").json()
+    db = client.app.state.db
+    with db._lock:
+        db.conn.execute(
+            "UPDATE evidence_packages SET seal = NULL, snapshot = ? WHERE evidence_id = ?",
+            ('{"target_date":"2026-03-02","effective_claims":[],"issues":[]}',
+             created["evidence_id"]),
+        )
+
+    read_body = client.get(f"/audit/evidence/{created['evidence_id']}").json()
+    assert read_body["verified"] is False
+    assert read_body["snapshot"] is None
+    assert read_body["integrity_error"]["code"] == "SNAPSHOT_DIGEST_MISMATCH"
+
+
+def test_old_schema_database_is_migrated(tmp_path):
+    """无 seal 列的旧版库打开后自动迁移；其中的旧包可读但不得 verified=true。"""
+    import sqlite3
+
+    db_path = str(tmp_path / "old.db")
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE evidence_packages (
+            evidence_id        TEXT PRIMARY KEY,
+            application_number TEXT NOT NULL,
+            target_date        TEXT NOT NULL,
+            snapshot           TEXT NOT NULL,
+            sha256             TEXT NOT NULL,
+            created_at         TEXT NOT NULL
+        );
+        """
+    )
+    snapshot = '{"target_date":"2026-03-01","effective_claims":[],"issues":[]}'
+    digest = hashlib.sha256(snapshot.encode("utf-8")).hexdigest()
+    conn.execute(
+        "INSERT INTO evidence_packages VALUES (?, ?, ?, ?, ?, ?)",
+        ("a" * 32, "CN-OLD", "2026-03-01", snapshot, digest, "2026-01-01T00:00:00+00:00"),
+    )
+    conn.commit()
+    conn.close()
+
+    app = create_app(db_path)
+    with TestClient(app) as c:
+        r = c.get("/audit/evidence/" + "a" * 32)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["digest"] == digest
+        assert body["stored_digest"] == digest
+        assert body["verified"] is False
+        assert body["snapshot"] is None
+        assert body["integrity_error"]["code"] == "SEAL_MISSING"
+    app.state.db.close()
+
+
+# ---------- 重启后仍可复验 ----------
+
+def test_new_packages_verify_after_restart(tmp_path):
+    """签发密钥持久化在库外密钥文件中：换进程重开同一库后，新旧包均可复验。"""
+    db_path = str(tmp_path / "restart.db")
+    app1 = create_app(db_path)
+    with TestClient(app1) as c1:
+        seed_basic(c1)
+        created = make_evidence(c1, "CN2026-001", "2026-03-01").json()
+    app1.state.db.close()
+
+    app2 = create_app(db_path)  # 同一库文件，模拟服务重启
+    with TestClient(app2) as c2:
+        before = c2.get(f"/audit/evidence/{created['evidence_id']}").json()
+        assert before["verified"] is True
+        assert before["digest"] == created["sha256"]
+
+        # 重启后签发的新包：同内容摘要稳定，且同样可复验
+        created2 = make_evidence(c2, "CN2026-001", "2026-03-01").json()
+        assert created2["sha256"] == created["sha256"]
+        assert created2["evidence_id"] != created["evidence_id"]
+        after = c2.get(f"/audit/evidence/{created2['evidence_id']}").json()
+        assert after["verified"] is True
+    app2.state.db.close()
+
+
+def test_seal_not_exposed_in_responses(client):
+    """签发依据只用于服务端复验，不出现在任何响应字段中。"""
+    seed_basic(client)
+    created = make_evidence(client, "CN2026-001", "2026-03-01").json()
+    assert set(created.keys()) == {"evidence_id", "application_number", "target_date", "sha256"}
+    read_body = client.get(f"/audit/evidence/{created['evidence_id']}").json()
+    assert "seal" not in read_body
+
+
 # ---------- 错误路径 ----------
 
 def test_evidence_unknown_application(client):

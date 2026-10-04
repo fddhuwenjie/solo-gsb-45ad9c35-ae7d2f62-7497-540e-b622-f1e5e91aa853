@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS evidence_packages (
     target_date        TEXT NOT NULL,
     snapshot           TEXT NOT NULL,  -- 冻结的规范 UTF-8 JSON（摘要即对其字节计算）
     sha256             TEXT NOT NULL,
+    seal               TEXT,           -- 签发依据：库外密钥对原内容的 HMAC；旧包为 NULL（无可靠依据）
     created_at         TEXT NOT NULL   -- 仅入库元数据，不参与摘要、不出现在快照中
 );
 
@@ -53,12 +54,20 @@ CREATE INDEX IF NOT EXISTS ix_evidence_application
 """
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """对既有库做就地升级：为 evidence_packages 补充 seal 列（旧行保持 NULL）。"""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(evidence_packages)")}
+    if "seal" not in columns:
+        conn.execute("ALTER TABLE evidence_packages ADD COLUMN seal TEXT")
+
+
 class Database:
     """单连接 + 可重入锁；显式事务（autocommit 模式）。"""
 
     def __init__(self, path: str):
         self.path = path
         self._lock = threading.RLock()
+        self._evidence_seal_key: bytes | None = None  # 由 evidence 模块惰性加载并缓存
         directory = os.path.dirname(os.path.abspath(path))
         os.makedirs(directory, exist_ok=True)
         self.conn = sqlite3.connect(path, check_same_thread=False)
@@ -67,6 +76,7 @@ class Database:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript(SCHEMA)
+        _migrate(self.conn)
 
     def close(self) -> None:
         with self._lock:
