@@ -1,6 +1,7 @@
 """审查证据包（POST/GET /audit/evidence）端到端测试。"""
 import hashlib
 import json
+import uuid
 
 import pytest
 from fastapi.testclient import TestClient
@@ -210,6 +211,121 @@ def test_tampered_stored_digest_reports_mismatch(client):
     assert read_body["integrity_error"]["code"] == "SNAPSHOT_DIGEST_MISMATCH"
     assert read_body["stored_digest"] == "0" * 64
     assert read_body["digest"] == created["sha256"]  # 重算值仍是原始摘要
+
+
+# ---------- 联动篡改（snapshot 与 sha256 一起替换） ----------
+
+def test_linked_tamper_snapshot_and_digest_rejected(client):
+    """把库内 snapshot 换成另一份合法快照、sha256 同步换成新摘要：
+    两者虽自洽，但与签发依据不符，不得判为可信。"""
+    seed_basic(client, "CN2026-001")
+    submit(client, "seed-b", "CN2026-002", [
+        rev(1, 1, "independent", [], text="另一种装置"),
+        rev(2, 1, "dependent", [1], text="如权利要求1所述的另一装置"),
+    ])
+    victim = make_evidence(client, "CN2026-001", "2026-03-01").json()
+    donor = make_evidence(client, "CN2026-002", "2026-03-01").json()
+    assert victim["sha256"] != donor["sha256"]
+
+    db = client.app.state.db
+    with db._lock:
+        donor_row = db.conn.execute(
+            "SELECT snapshot, sha256 FROM evidence_packages WHERE evidence_id = ?",
+            (donor["evidence_id"],),
+        ).fetchone()
+        db.conn.execute(
+            "UPDATE evidence_packages SET snapshot = ?, sha256 = ? WHERE evidence_id = ?",
+            (donor_row["snapshot"], donor_row["sha256"], victim["evidence_id"]),
+        )
+
+    read_body = client.get(f"/audit/evidence/{victim['evidence_id']}").json()
+    assert read_body["verified"] is False
+    assert read_body["snapshot"] is None
+    err = read_body["integrity_error"]
+    assert err["code"] == "EVIDENCE_SEAL_MISMATCH"
+    # 响应结构不变：digest 即现场重算值，stored_digest 即库内（被替换的）摘要
+    assert read_body["digest"] == donor["sha256"]
+    assert read_body["stored_digest"] == donor["sha256"]
+    assert err["stored_digest"] == donor["sha256"]
+    assert err["recomputed_digest"] == donor["sha256"]
+
+    # 供体包自身的签发依据未被波及，仍可复验
+    donor_read = client.get(f"/audit/evidence/{donor['evidence_id']}").json()
+    assert donor_read["verified"] is True
+    assert donor_read["digest"] == donor["sha256"]
+
+
+# ---------- 历史旧包（无签发依据） ----------
+
+def _insert_legacy_package(client, app_no, target, snapshot_text, digest):
+    """模拟修复前签发的旧包：直接落库，不经过封存台账。"""
+    evidence_id = uuid.uuid4().hex
+    db = client.app.state.db
+    with db._lock:
+        db.conn.execute(
+            "INSERT INTO evidence_packages"
+            " (evidence_id, application_number, target_date, snapshot, sha256, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (evidence_id, app_no, target, snapshot_text, digest,
+             "2026-01-01T00:00:00+00:00"),
+        )
+    return evidence_id
+
+
+def test_legacy_package_without_seal_not_verified(client):
+    """旧随机编号仍可读取，但仅凭库内摘要自洽不得返回 verified=true。"""
+    seed_basic(client)
+    raw = json.dumps(
+        {"target_date": "2026-03-01", "effective_claims": [], "issues": []},
+        ensure_ascii=False, separators=(",", ":"),
+    )
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    evidence_id = _insert_legacy_package(client, "CN2026-001", "2026-03-01", raw, digest)
+
+    resp = client.get(f"/audit/evidence/{evidence_id}")
+    assert resp.status_code == 200  # 旧编号仍能读取，响应结构不变
+    read_body = resp.json()
+    assert read_body["verified"] is False
+    assert read_body["snapshot"] is None
+    assert read_body["digest"] == digest
+    assert read_body["stored_digest"] == digest
+    err = read_body["integrity_error"]
+    assert err["code"] == "EVIDENCE_SEAL_MISSING"
+    assert err["stored_digest"] == digest
+    assert err["recomputed_digest"] == digest
+
+
+def test_legacy_package_single_tamper_report_still_works(client):
+    """旧包发生单项篡改时，既有的摘要不匹配报告继续有效（优先于依据缺失）。"""
+    seed_basic(client)
+    raw = '{"target_date":"2026-03-01","effective_claims":[],"issues":[]}'
+    evidence_id = _insert_legacy_package(client, "CN2026-001", "2026-03-01", raw, "1" * 64)
+
+    read_body = client.get(f"/audit/evidence/{evidence_id}").json()
+    assert read_body["verified"] is False
+    assert read_body["snapshot"] is None
+    assert read_body["integrity_error"]["code"] == "SNAPSHOT_DIGEST_MISMATCH"
+    assert read_body["stored_digest"] == "1" * 64
+
+
+# ---------- 重启后复验 ----------
+
+def test_new_package_reverifiable_after_restart(tmp_path):
+    """签发依据随数据目录持久化：换新进程（新 app 实例）后新包仍可复验。"""
+    db_path = str(tmp_path / "restart.db")
+    app1 = create_app(db_path)
+    with TestClient(app1) as c1:
+        seed_basic(c1)
+        created = make_evidence(c1, "CN2026-001", "2026-03-01").json()
+    app1.state.db.close()
+
+    app2 = create_app(db_path)
+    with TestClient(app2) as c2:
+        read_body = c2.get(f"/audit/evidence/{created['evidence_id']}").json()
+        assert read_body["verified"] is True
+        assert read_body["digest"] == created["sha256"]
+        assert read_body["snapshot"]["target_date"] == "2026-03-01"
+    app2.state.db.close()
 
 
 # ---------- 错误路径 ----------

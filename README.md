@@ -12,7 +12,8 @@ docker compose up --build
 - **API 端口：`8000`**（宿主机 `8000` → 容器 `8000`，见 `docker-compose.yml`）
 - 交互式文档：http://localhost:8000/docs （Swagger UI）
 - 健康检查：`GET http://localhost:8000/health`
-- SQLite 数据持久化在命名卷 `patent-data`（容器内 `/data/app.db`，可用环境变量 `DATABASE_PATH` 覆盖）
+- SQLite 数据持久化在命名卷 `patent-data`（容器内 `/data/app.db`，可用环境变量 `DATABASE_PATH` 覆盖）；
+  证据包签发依据 `evidence_seals.jsonl` 与数据库同目录、随同一卷持久化，重启后新包仍可复验
 
 本地开发（不用 Docker）：
 
@@ -120,18 +121,36 @@ curl -X POST http://localhost:8000/audit/evidence \
 **摘要只覆盖该冻结载荷**，不含 `evidence_id`、生成时间等易变字段；
 对同一数据状态下的同一输入重复生成，摘要必然相同（每次生成仍是独立的新包，`evidence_id` 不同）。
 
+**签发依据（封存台账）**：签发每个新包时，服务把 `(evidence_id, sha256, sealed_at)`
+追加写入数据库目录下的 `evidence_seals.jsonl`（与 `app.db` 同目录、随 `patent-data`
+卷持久化的只追加 JSON 行文件）。该台账**不属于任何可改写的数据库记录**，
+是复验时确认「这就是签发时的原内容」的依据；重启后台账仍在，新包照常可复验。
+
 ### GET /audit/evidence/{evidence_id} — 只读复验
 
-只读取冻结快照，**不回查修订表**：重新计算 SHA-256 并与存储摘要比对：
+只读取冻结快照，**不回查修订表**。复验同时核对三项，任一不符即判不可信：
+
+1. **冻结字节 ↔ 库存摘要**：重新计算快照字节的 SHA-256，与库内 `sha256` 比对；
+2. **签发依据**：台账 `evidence_seals.jsonl` 中该 `evidence_id` 封存的原摘要必须与当前摘要一致——
+   攻击者即使把库内 `snapshot` 与 `sha256` **一起**替换成另一份合法快照（两者自洽），
+   也无法改写台账中的签发记录，替换内容不会被判为可信；
+3. **快照须为合法 JSON**。
 
 ```bash
 curl http://localhost:8000/audit/evidence/bafd97da246040fca6327cd86e77529a
 ```
 
-- 摘要一致：`verified: true`，返回 `snapshot`（冻结的目标日 / 有效权利要求 / 问题）；
-- 快照或存储摘要被篡改：仍返回 `200`，但 `verified: false`、`snapshot: null`，
-  并在 `integrity_error` 中以 `SNAPSHOT_DIGEST_MISMATCH` 同时给出
-  `stored_digest` 与现场重算的 `recomputed_digest`（`digest` 字段即重算值）；
+- 三项全部通过：`verified: true`，返回 `snapshot`（冻结的目标日 / 有效权利要求 / 问题）；
+- 任一项不符：仍返回 `200` 与原响应结构，但 `verified: false`、`snapshot: null`，
+  并在 `integrity_error` 中报告（`digest` 字段始终为现场重算值）：
+
+| `integrity_error.code` | 含义 |
+|---|---|
+| `SNAPSHOT_DIGEST_MISMATCH` | 单项篡改：重算摘要与库存摘要不一致（`stored_digest` 与 `recomputed_digest` 同时给出） |
+| `EVIDENCE_SEAL_MISMATCH` | 联动篡改：库内快照与摘要被整体替换，与签发时封存的原摘要不符（或台账已损坏） |
+| `EVIDENCE_SEAL_MISSING` | 无可靠签发依据（修复前签发的历史旧包，见下节） |
+| `SNAPSHOT_CORRUPT` | 摘要匹配但快照不是合法 JSON |
+
 - 证据包不存在：`404`。
 
 ```json
@@ -156,6 +175,21 @@ curl http://localhost:8000/audit/evidence/bafd97da246040fca6327cd86e77529a
 即使之后的修订自动封闭了该区间）。任何持有快照的一方都可以自行复算
 `SHA-256(UTF-8 紧凑 JSON)` 与返回摘要比对。
 
+#### 历史旧包的状态与调用方式
+
+引入封存台账**之前**签发的证据包（库内只有随机 `evidence_id` 与自洽的
+`snapshot`/`sha256`，台账中没有对应记录）：
+
+- **仍可读取**：`GET /audit/evidence/{旧 evidence_id}` 照常返回 `200` 与原有字段，
+  不会变成 `404`；
+- **但一律不可信**：没有可靠签发依据，不得仅凭库内摘要一致判为可信，
+  响应固定为 `verified: false`、`snapshot: null`、`integrity_error.code = EVIDENCE_SEAL_MISSING`；
+- 若旧包还发生了单项篡改（快照或摘要其一被改），既有的
+  `SNAPSHOT_DIGEST_MISMATCH` 报告继续有效、优先返回；
+- **如何获得可复验的包**：用相同请求体重发 `POST /audit/evidence` 即可签发新包——
+  输入不变、同一数据状态下摘要不变，新 `evidence_id` 自签发起纳入台账保护，
+  重启后仍可复验。
+
 ### 其他端点
 
 - `GET /applications/{application_number}` — 查看某申请的完整版本链（调试/核对用）
@@ -169,7 +203,7 @@ app/
   models.py    # Pydantic 请求/响应模型（含提交期结构校验）
   store.py     # 写入路径：幂等 + 版本链校验 + 单事务
   audit.py     # 目标日重建、引用有效性、DFS 成环检测
-  evidence.py  # 证据包：固定字段顺序冻结 UTF-8 JSON、SHA-256、只读复验/篡改报告
+  evidence.py  # 证据包：固定字段顺序冻结 UTF-8 JSON、SHA-256、封存台账签发依据、只读复验/篡改报告
   db.py        # SQLite 连接与 schema（含 evidence_packages 快照表）
   errors.py    # 领域错误 → HTTP 状态码
 tests/test_api.py
